@@ -5,3 +5,9 @@ Baran is a new context-aware error correction system, which provides a unifying 
 
 ## Usage
 The full documentation and a user interface is `coming soon`.
+![Data Annotation](pictures/ui.png)   
+![User Support](pictures/ui_annotation.png)   
+![Dashboard](pictures/ui_dashboard.png)   
+
+## Related Projects
+Check out [Raha](https://github.com/bigdama/raha).
