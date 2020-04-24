@@ -1,5 +1,5 @@
 ########################################
-# Raha 2
+# Baran
 # Mohammad Mahdavi
 # moh.mahdavi.l@gmail.com
 # April 2019
@@ -13,107 +13,111 @@
 import os
 import re
 import io
+import sys
+import math
 import json
 import html
 import pickle
-import unicodedata
 import difflib
-import libarchive.public
+import unicodedata
+
 import bs4
 import bz2
 import numpy
 import mwparserfromhell
-import sklearn.naive_bayes
-import sklearn.linear_model
+import libarchive.public
 import sklearn.svm
 import sklearn.ensemble
+import sklearn.naive_bayes
+import sklearn.linear_model
+
 import dataset
 ########################################
 
 
 ########################################
-class Raha2:
+class Baran:
     """
     The main class.
     """
 
     def __init__(self):
         """
-        The constructor sets up.
+        The constructor.
         """
-        self.DATASETS_FOLDER = "datasets"
-        self.RESULTS_FOLDER = "results"
-        self.WIKIPEDIA_DUMPS_FOLDER = "../wikipedia-data-sample"
+        self.PRETRAINED_VALUE_BASED_MODELS_PATH = ""
         self.VALUE_ENCODINGS = ["identity", "unicode"]
         self.CLASSIFICATION_MODEL = "ABC"   # ["ABC", "DTC", "GBC", "GNB", "KNC" ,"SGDC", "SVC"]
         self.IGNORE_SIGN = "<<<IGNORE_THIS_VALUE>>>"
+        self.VERBOSE = True
+        self.SAVE_RESULTS = True
         self.ONLINE_PHASE = False
-        self.RUN_COUNT = 1
+        self.REFINE_PREDICTIONS = True
         self.LABELING_BUDGET = 20
-        self.MIN_FD_DEGREE = 0.95
-        self.MIN_CORRECTION_PROBABILITY = 0.01
         self.MAX_VALUE_LENGTH = 50
-        self.CONTEXT_WINDOW_SIZE = 5
+        self.REVISION_WINDOW_SIZE = 5
 
     @staticmethod
-    def wiki_text_segmenter(text):
+    def _wikitext_segmenter(wikitext):
         """
-        This method is a custom segmenter that takes a wikipedia text and segments it.
+        This method takes a Wikipedia page revision text in wikitext and segments it recursively.
         """
-        def recursive_parser(node):
-            if not node:
-                pass
-            elif isinstance(node, str):
+        def recursive_segmenter(node):
+            if isinstance(node, str):
                 segments_list.append(node)
-            elif isinstance(node, mwparserfromhell.nodes.text.Text):
-                segments_list.append(node.value)
+            # elif isinstance(node, mwparserfromhell.nodes.text.Text):
+            #     segments_list.append(node.value)
+            elif not node:
+                pass
             elif isinstance(node, mwparserfromhell.wikicode.Wikicode):
                 for n in node.nodes:
-                    if isinstance(n, str) or isinstance(n, mwparserfromhell.nodes.text.Text) or not n:
-                        recursive_parser(n)
+                    if isinstance(n, str):
+                        recursive_segmenter(n)
+                    elif isinstance(n, mwparserfromhell.nodes.text.Text):
+                        recursive_segmenter(n.value)
                     elif isinstance(n, mwparserfromhell.nodes.heading.Heading):
-                        recursive_parser(n.title)
+                        recursive_segmenter(n.title)
                     elif isinstance(n, mwparserfromhell.nodes.tag.Tag):
-                        recursive_parser(n.contents)
+                        recursive_segmenter(n.contents)
                     elif isinstance(n, mwparserfromhell.nodes.wikilink.Wikilink):
                         if n.text:
-                            recursive_parser(n.text)
+                            recursive_segmenter(n.text)
                         else:
-                            recursive_parser(n.title)
+                            recursive_segmenter(n.title)
                     elif isinstance(n, mwparserfromhell.nodes.external_link.ExternalLink):
                         # recursive_parser(n.url)
-                        recursive_parser(n.title)
+                        recursive_segmenter(n.title)
                     elif isinstance(n, mwparserfromhell.nodes.template.Template):
-                        recursive_parser(n.name)
+                        recursive_segmenter(n.name)
                         for p in n.params:
                             # recursive_parser(p.name)
-                            recursive_parser(p.value)
+                            recursive_segmenter(p.value)
                     elif isinstance(n, mwparserfromhell.nodes.html_entity.HTMLEntity):
                         segments_list.append(n.normalize())
-                    elif isinstance(n, mwparserfromhell.nodes.comment.Comment) or \
+                    elif not n or isinstance(n, mwparserfromhell.nodes.comment.Comment) or \
                             isinstance(n, mwparserfromhell.nodes.argument.Argument):
                         pass
                     else:
-                        print("Second layer unknown node:", type(n), n)
+                        sys.stderr.write("Inner layer unknown node found: {}, {}\n".format(type(n), n))
             else:
-                print("First layer unknown node:", type(node), node)
+                sys.stderr.write("Outer layer unknown node found: {}, {}\n".format(type(node), node))
 
         segments_list = []
-        wiki_code = mwparserfromhell.parse(text)
-        recursive_parser(wiki_code)
+        parsed_wikitext = mwparserfromhell.parse(wikitext)
+        recursive_segmenter(parsed_wikitext)
         return segments_list
 
-    def revision_extractor(self):
+    def extract_revisions(self, wikipedia_dumps_folder):
         """
-        This method extracts the revision data from the wikipedia page revisions.
+        This method takes the folder path of Wikipedia page revision history dumps and extracts the value-based corrections.
         """
-        rd_folder_path = os.path.join(self.RESULTS_FOLDER, "revision-data")
+        rd_folder_path = os.path.join(wikipedia_dumps_folder, "revision-data")
         if not os.path.exists(rd_folder_path):
             os.mkdir(rd_folder_path)
-        compressed_dumps_list = os.listdir(self.WIKIPEDIA_DUMPS_FOLDER)
+        compressed_dumps_list = os.listdir(wikipedia_dumps_folder)
         page_counter = 0
         for file_name in compressed_dumps_list:
-            compressed_dump_file_path = os.path.join(self.WIKIPEDIA_DUMPS_FOLDER, file_name)
+            compressed_dump_file_path = os.path.join(wikipedia_dumps_folder, file_name)
             if not compressed_dump_file_path.endswith(".7z"):
                 continue
             dump_file_name, _ = os.path.splitext(os.path.basename(compressed_dump_file_path))
@@ -123,11 +127,12 @@ class Raha2:
             else:
                 continue
             decompressed_dump_file_path = os.path.splitext(compressed_dump_file_path)[0]
+            # TODO use only one of these
             with libarchive.public.file_reader(compressed_dump_file_path) as e:
                 for entry in e:
-                    with open(decompressed_dump_file_path, "wb") as f:
+                    with open(decompressed_dump_file_path, "wb") as fh:
                         for block in entry.get_blocks():
-                            f.write(block)
+                            fh.write(block)
             # compressed_dump_file = io.open(compressed_dump_file_path, "rb")
             # compressed_dump = py7zlib.Archive7z(compressed_dump_file)
             # decompressed_dump_file = io.open(decompressed_dump_file_path, "w")
@@ -149,8 +154,8 @@ class Raha2:
                     for revision_tag in page_tree.find_all("revision"):
                         revision_text = revision_tag.find_all("text")[0].text
                         if previous_text:
-                            a = [t for t in self.wiki_text_segmenter(previous_text) if t]
-                            b = [t for t in self.wiki_text_segmenter(revision_text) if t]
+                            a = [t for t in self._wikitext_segmenter(previous_text) if t]
+                            b = [t for t in self._wikitext_segmenter(revision_text) if t]
                             s = difflib.SequenceMatcher(None, a, b)
                             for tag, i1, i2, j1, j2 in s.get_opcodes():
                                 if tag == "equal":
@@ -158,13 +163,13 @@ class Raha2:
                                 revisions_list.append({
                                     "old_value": a[i1:i2],
                                     "new_value": b[j1:j2],
-                                    "left_context": a[i1 - self.CONTEXT_WINDOW_SIZE:i1],
-                                    "right_context": a[i2:i2 + self.CONTEXT_WINDOW_SIZE]
+                                    "left_context": a[i1 - self.REVISION_WINDOW_SIZE:i1],
+                                    "right_context": a[i2:i2 + self.REVISION_WINDOW_SIZE]
                                 })
                         previous_text = revision_text
                     if revisions_list:
                         page_counter += 1
-                        if page_counter % 100 == 0:
+                        if self.VERBOSE and page_counter % 100 == 0:
                             for entry in revisions_list:
                                 print("----------Page Counter:---------\n", page_counter,
                                       "\n----------Old Value:---------\n", entry["old_value"],
@@ -177,19 +182,20 @@ class Raha2:
             os.remove(decompressed_dump_file_path)
 
     @staticmethod
-    def value_normalizer(value):
+    def _value_normalizer(value):
         """
-        This method normalizes a value.
+        This method takes a value and minimally normalizes it.
         """
+        # TODO: move it to the dataset class
         value = html.unescape(value)
         value = re.sub("[\t\n ]+", " ", value, re.UNICODE)
         value = value.strip("\t\n ")
         return value
 
     @staticmethod
-    def value_encoder(value, encoding):
+    def _value_encoder(value, encoding):
         """
-        This method represents a value with a specified encoding method.
+        This method represents a value with a specified value abstraction encoding method.
         """
         if encoding == "identity":
             return json.dumps(list(value))
@@ -197,9 +203,9 @@ class Raha2:
             return json.dumps([unicodedata.category(c) for c in value])
 
     @staticmethod
-    def add_to_model_helper(model, key, value):
+    def _to_model_adder(model, key, value):
         """
-        This methods adds a key-value into a model dictionary.
+        This methods incrementally adds a key-value into a dictionary-implemented model.
         """
         if key not in model:
             model[key] = {}
@@ -207,11 +213,11 @@ class Raha2:
             model[key][value] = 0.0
         model[key][value] += 1.0
 
-    def value_based_models_updater(self, models, ud):
+    def _value_based_models_updater(self, models, ud):
         """
-        This method updates the value-based error corrector models.
+        This method updates the value-based error corrector models with a given update dictionary.
         """
-        # TODO: building "shifter" model for dd.mm.yy -> mm.dd.yy
+        # TODO: adding jabeja konannde bakhshahye substring
         if self.ONLINE_PHASE or (ud["new_value"] and len(ud["new_value"]) <= self.MAX_VALUE_LENGTH and
                                  ud["old_value"] and len(ud["old_value"]) <= self.MAX_VALUE_LENGTH and
                                  ud["old_value"] != ud["new_value"]):
@@ -228,54 +234,38 @@ class Raha2:
                 if tag == "replace":
                     replacer_transformation[index_range] = ud["new_value"][j1:j2]
             for encoding in self.VALUE_ENCODINGS:
-                encoded_old_value = self.value_encoder(ud["old_value"], encoding)
+                encoded_old_value = self._value_encoder(ud["old_value"], encoding)
                 if remover_transformation:
-                    self.add_to_model_helper(models[0], encoded_old_value, json.dumps(remover_transformation))
+                    self._to_model_adder(models[0], encoded_old_value, json.dumps(remover_transformation))
                 if adder_transformation:
-                    self.add_to_model_helper(models[1], encoded_old_value, json.dumps(adder_transformation))
+                    self._to_model_adder(models[1], encoded_old_value, json.dumps(adder_transformation))
                 if replacer_transformation:
-                    self.add_to_model_helper(models[2], encoded_old_value, json.dumps(replacer_transformation))
-                self.add_to_model_helper(models[3], encoded_old_value, ud["new_value"])
+                    self._to_model_adder(models[2], encoded_old_value, json.dumps(replacer_transformation))
+                self._to_model_adder(models[3], encoded_old_value, ud["new_value"])
 
-    def context_based_models_updater(self, models, ud):
-        """
-        This method updates the context-based error corrector models.
-        """
-        for j, cv in enumerate(ud["context"]):
-            if cv != self.IGNORE_SIGN:
-                self.add_to_model_helper(models[j][ud["column"]], cv, ud["new_value"])
-
-    def domain_based_model_updater(self, model, ud):
-        """
-        This method updates the domain-based error corrector model.
-        """
-        self.add_to_model_helper(model, ud["column"], ud["new_value"])
-
-    def value_based_models_pretrainer(self):
+    def pretrain_value_based_models(self, revision_data_folder):
         """
         This method pretrains value-based error corrector models.
         """
-        cm_folder_path = os.path.join(self.RESULTS_FOLDER, "corrector-models")
-        if not os.path.exists(cm_folder_path):
-            os.mkdir(cm_folder_path)
         models = [{}, {}, {}, {}]
-        rd_folder_path = os.path.join(self.RESULTS_FOLDER, "revision-data")
+        rd_folder_path = revision_data_folder
         page_counter = 0
         for folder in os.listdir(rd_folder_path):
-            for f in os.listdir(os.path.join(rd_folder_path, folder)):
-                page_counter += 1
-                if page_counter % 100 == 0:
-                    print(page_counter, "pages processed.")
-                revision_list = json.load(io.open(os.path.join(rd_folder_path, folder, f), encoding="utf-8"))
-                for r in revision_list:
-                    update_dictionary = {
-                        "old_value": self.value_normalizer("".join(r["old_value"])),
-                        "new_value": self.value_normalizer("".join(r["new_value"]))
-                    }
-                    self.value_based_models_updater(models, update_dictionary)
+            if os.path.isdir(os.path.join(rd_folder_path, folder)):
+                for rf in os.listdir(os.path.join(rd_folder_path, folder)):
+                    if rf.endswith(".json"):
+                        page_counter += 1
+                        if self.VERBOSE and page_counter % 100 == 0:
+                            print(page_counter, "pages are processed.")
+                        revision_list = json.load(io.open(os.path.join(rd_folder_path, folder, rf), encoding="utf-8"))
+                        for rd in revision_list:
+                            update_dictionary = {
+                                "old_value": self._value_normalizer("".join(rd["old_value"])),
+                                "new_value": self._value_normalizer("".join(rd["new_value"]))
+                            }
+                            self._value_based_models_updater(models, update_dictionary)
         pruned_models = []
-        for model in models:
-            new_model = {}
+        for mi, model in enumerate(models):
             pruning_threshold = 0.0
             ctr = 0
             for k in model:
@@ -283,16 +273,39 @@ class Raha2:
                     pruning_threshold += model[k][v]
                     ctr += 1
             pruning_threshold /= ctr
-            print("Pruning Threshold =", pruning_threshold)
+            if self.VERBOSE:
+                print("The pruning threshold is {:.2f} for model {}.".format(pruning_threshold, mi))
+            new_model = {}
             for k in model:
                 for v in model[k]:
                     if model[k][v] >= pruning_threshold:
-                        self.add_to_model_helper(new_model, k, v)
+                        self._to_model_adder(new_model, k, v)
                         new_model[k][v] = model[k][v]
             pruned_models.append(new_model)
-        pickle.dump(pruned_models, bz2.BZ2File(os.path.join(cm_folder_path, "value_models.dictionary"), "wb"))
+        pretrained_models_path = os.path.join(revision_data_folder, "pretrained_value_based_models.dictionary")
+        if self.PRETRAINED_VALUE_BASED_MODELS_PATH:
+            pretrained_models_path = self.PRETRAINED_VALUE_BASED_MODELS_PATH
+        pickle.dump(pruned_models, bz2.BZ2File(pretrained_models_path, "wb"))
+        if self.VERBOSE:
+            print("The pretrained value-based models are stored in {}.".format(pretrained_models_path))
 
-    def value_based_corrector(self, models, ed):
+    def _vicinity_based_models_updater(self, models, ud):
+        """
+        This method updates the vicinity-based error corrector models with a given update dictionary.
+        """
+        # TODO: behtaresh konam. masalan value kenari ro encode konam ya fd ro bar asase zirreshte hesab konam
+        for j, cv in enumerate(ud["vicinity"]):
+            if cv != self.IGNORE_SIGN:
+                self._to_model_adder(models[j][ud["column"]], cv, ud["new_value"])
+
+    def _domain_based_model_updater(self, model, ud):
+        """
+        This method updates the domain-based error corrector model with a given update dictionary.
+        """
+        # TODO: be tor koli tar begam relevance score moheme ke ounam 3 chize: tekrar, fasele characteri, fasele adadi.
+        self._to_model_adder(model, ud["column"], ud["new_value"])
+
+    def _value_based_corrector(self, models, ed):
         """
         This method takes the value-based models and an error dictionary to generate potential value-based corrections.
         """
@@ -301,7 +314,7 @@ class Raha2:
             model = models[m]
             for encoding in self.VALUE_ENCODINGS:
                 results_dictionary = {}
-                encoded_value_string = self.value_encoder(ed["old_value"], encoding)
+                encoded_value_string = self._value_encoder(ed["old_value"], encoding)
                 if encoded_value_string in model:
                     sum_scores = sum(model[encoded_value_string].values())
                     if model_name in ["remover", "adder", "replacer"]:
@@ -320,235 +333,298 @@ class Raha2:
                             new_value = ""
                             for i in range(len(index_character_dictionary)):
                                 new_value += index_character_dictionary[i]
-                            p = model[encoded_value_string][transformation_string] / sum_scores
-                            if p >= self.MIN_CORRECTION_PROBABILITY:
-                                results_dictionary[new_value] = p
+                            results_dictionary[new_value] = model[encoded_value_string][transformation_string] / sum_scores
                     if model_name == "swapper":
                         for new_value in model[encoded_value_string]:
-                            p = model[encoded_value_string][new_value] / sum_scores
-                            if p >= self.MIN_CORRECTION_PROBABILITY:
-                                results_dictionary[new_value] = p
+                            results_dictionary[new_value] = model[encoded_value_string][new_value] / sum_scores
                 results_list.append(results_dictionary)
         return results_list
 
-    def context_based_corrector(self, models, ed):
+    @staticmethod
+    def _vicinity_based_corrector(models, ed):
         """
-        This method takes the context-based models and an error dictionary to generate potential context-based corrections.
+        This method takes the vicinity-based models and an error dictionary to generate potential vicinity-based corrections.
         """
         results_list = []
-        for j, cv in enumerate(ed["context"]):
+        for j, cv in enumerate(ed["vicinity"]):
             results_dictionary = {}
             if j != ed["column"] and cv in models[j][ed["column"]]:
                 sum_scores = sum(models[j][ed["column"]][cv].values())
                 for new_value in models[j][ed["column"]][cv]:
-                    p = models[j][ed["column"]][cv][new_value] / sum_scores
-                    if p >= self.MIN_CORRECTION_PROBABILITY:
-                        results_dictionary[new_value] = p
+                    results_dictionary[new_value] = models[j][ed["column"]][cv][new_value] / sum_scores
             results_list.append(results_dictionary)
         return results_list
 
-    def domain_based_corrector(self, model, ed):
+    @staticmethod
+    def _domain_based_corrector(model, ed):
         """
         This method takes a domain-based model and an error dictionary to generate potential domain-based corrections.
         """
         results_dictionary = {}
         sum_scores = sum(model[ed["column"]].values())
         for new_value in model[ed["column"]]:
-            p = model[ed["column"]][new_value] / sum_scores
-            if p >= self.MIN_CORRECTION_PROBABILITY:
-                results_dictionary[new_value] = p
-        return results_dictionary
+            results_dictionary[new_value] = model[ed["column"]][new_value] / sum_scores
+        return [results_dictionary]
 
-    def error_corrector(self, d, all_errors):
+    def initialize_dataset(self, d):
         """
-        This method generates the possible corrections for each data error and learns to predict the right ones.
+        This method initializes the dataset.
         """
         self.ONLINE_PHASE = True
-        data_errors_per_column = {}
-        for cell in all_errors:
-            self.add_to_model_helper(data_errors_per_column, cell[1], cell)
-        cm_folder_path = os.path.join(self.RESULTS_FOLDER, "corrector-models")
-        value_models = pickle.load(bz2.BZ2File(os.path.join(cm_folder_path, "value_models.dictionary"), "rb"))
-        context_models = {j: {jj: {} for jj in range(d.dataframe.shape[1])} for j in range(d.dataframe.shape[1])}
-        domain_model = {}
-        for i in range(d.dataframe.shape[0]):
-            if i % 1000 == 0:
-                print(i)
-            for j in range(d.dataframe.shape[1]):
-                # TODO
-                # d.dataframe.iloc[i, j] = self.value_normalizer(d.dataframe.iloc[i, j])
-                if (i, j) not in all_errors:
+        d.results_folder = os.path.join(os.path.dirname(d.path), "baran-results-" + d.name)
+        if self.SAVE_RESULTS and not os.path.exists(d.results_folder):
+            os.mkdir(d.results_folder)
+        d.column_errors = {}
+        for cell in d.detected_cells:
+            self._to_model_adder(d.column_errors, cell[1], cell)
+        d.labeled_tuples = {}
+        d.labeled_cells = {}
+        d.corrected_cells = {}
+        return d
+
+    def initialize_models(self, d):
+        """
+        This method initializes the error corrector models.
+        """
+        d.value_models = [{}, {}, {}, {}]
+        if os.path.exists(self.PRETRAINED_VALUE_BASED_MODELS_PATH):
+            d.value_models = pickle.load(bz2.BZ2File(self.PRETRAINED_VALUE_BASED_MODELS_PATH, "rb"))
+            if self.VERBOSE:
+                print("The pretrained value-based models are loaded.")
+        d.vicinity_models = {j: {jj: {} for jj in range(d.dataframe.shape[1])} for j in range(d.dataframe.shape[1])}
+        d.domain_models = {}
+        for row in d.dataframe.itertuples():
+            i, row = row[0], row[1:]
+            vicinity_list = [cv if (i, cj) not in d.detected_cells else self.IGNORE_SIGN for cj, cv in enumerate(row)]
+            for j, value in enumerate(row):
+                if (i, j) not in d.detected_cells:
+                    temp_vicinity_list = list(vicinity_list)
+                    temp_vicinity_list[j] = self.IGNORE_SIGN
                     update_dictionary = {
                         "column": j,
-                        "new_value": d.dataframe.iloc[(i, j)],
-                        "context": [cv if (j != cj and (i, cj) not in all_errors)
-                                    else self.IGNORE_SIGN for cj, cv in enumerate(d.dataframe.iloc[i, :])]
+                        "new_value": value,
+                        "vicinity": temp_vicinity_list
                     }
-                    self.context_based_models_updater(context_models, update_dictionary)
-                    self.domain_based_model_updater(domain_model, update_dictionary)
-        fd_degree = numpy.zeros((d.dataframe.shape[1], d.dataframe.shape[1]))
+                    self._vicinity_based_models_updater(d.vicinity_models, update_dictionary)
+                    self._domain_based_model_updater(d.domain_models, update_dictionary)
+        if self.VERBOSE:
+            print("The error corrector models are initialized.")
+
+    def sample_tuple(self, d):
+        """
+        This method samples a tuple.
+        """
+        remaining_column_errors = {}
+        remaining_column_erroneous_values = {}
+        for j in d.column_errors:
+            for cell in d.column_errors[j]:
+                if cell not in d.corrected_cells:
+                    self._to_model_adder(remaining_column_errors, j, cell)
+                    self._to_model_adder(remaining_column_erroneous_values, j, d.dataframe.iloc[cell])
+        tuple_score = numpy.ones(d.dataframe.shape[0])
+        tuple_score[list(d.labeled_tuples.keys())] = 0.0
+        for j in remaining_column_errors:
+            for cell in remaining_column_errors[j]:
+                value = d.dataframe.iloc[cell]
+                column_score = len(remaining_column_errors[j]) / len(d.column_errors[j])
+                cell_score = remaining_column_erroneous_values[j][value] / len(remaining_column_errors[j])
+                tuple_score[cell[0]] *= math.exp(column_score) * math.exp(cell_score)
+        d.sampled_tuple = numpy.random.choice(numpy.argwhere(tuple_score == numpy.amax(tuple_score)).flatten())
+        # d.sampled_tuple = numpy.argmax(tuple_score)
+        # sum_tuple_score = sum(tuple_score)
+        # p_tuple_score = tuple_score / sum_tuple_score
+        # si = numpy.random.choice(numpy.arange(len(tuple_score)), 1, p=p_tuple_score)[0]
+        if self.VERBOSE:
+            print("Tuple {} is sampled.".format(d.sampled_tuple))
+
+    def label_with_ground_truth(self, d):
+        """
+        This method labels a tuple with ground truth.
+        """
+        d.labeled_tuples[d.sampled_tuple] = 1
         for j in range(d.dataframe.shape[1]):
-            for jj in range(d.dataframe.shape[1]):
-                if j != jj:
-                    for v in context_models[j][jj]:
-                        if len(context_models[j][jj][v]) <= 1:
-                            fd_degree[j, jj] += 1
-                    if len(context_models[j][jj]) > 0:
-                        fd_degree[j, jj] /= len(context_models[j][jj])
-                    if fd_degree[j, jj] < self.MIN_FD_DEGREE:
-                        context_models[j][jj] = {}
-                    else:
-                        print(j, jj)
-        sampling_range = range(1, self.LABELING_BUDGET + 1)
-        aggregate_results = {s: numpy.empty((0, 3)) for s in sampling_range}
-        for r in range(self.RUN_COUNT):
-            print("Run {}...".format(r))
-            labeled_tuples = {}
-            correction_dictionary = {}
-            while len(labeled_tuples) < self.LABELING_BUDGET:
-                remaining_data_errors_per_column = numpy.zeros(d.dataframe.shape[1])
-                for cell in all_errors:
-                    if cell not in correction_dictionary:
-                        remaining_data_errors_per_column[cell[1]] += 1.0
-                tuple_score = numpy.zeros(d.dataframe.shape[0])
-                for cell in all_errors:
-                    if cell not in correction_dictionary:
-                        tuple_score[cell[0]] += remaining_data_errors_per_column[cell[1]]
-                if sum(tuple_score) == 0:
-                    si = numpy.random.choice(range(len(tuple_score)))
-                else:
-                    # sum_tuple_score = sum(tuple_score)
-                    # p_tuple_score = tuple_score / sum_tuple_score
-                    # si = numpy.random.choice(numpy.arange(len(tuple_score)), 1, p=p_tuple_score)[0]
-                    si = numpy.argmax(tuple_score)
-                    # si = numpy.random.choice(list(xxx.keys()))
-                labeled_tuples[si] = 1
-                for j in range(d.dataframe.shape[1]):
-                    cell = (si, j)
-                    if cell in all_errors:
-                        dirty_value = d.dataframe.iloc[cell]
-                        clean_value = d.clean_dataframe.iloc[cell]
-                        correction_dictionary[cell] = clean_value
-                        update_dictionary = {
-                            "column": cell[1],
-                            "old_value": dirty_value,
-                            "new_value": clean_value,
-                        }
-                        self.value_based_models_updater(value_models, update_dictionary)
-                        self.domain_based_model_updater(domain_model, update_dictionary)
-                temp_cleaned_row = [correction_dictionary[(si, j)] if (si, j) in all_errors else v
-                                    for j, v in enumerate(d.dataframe.iloc[si, :])]
-                for j in range(d.dataframe.shape[1]):
-                    update_dictionary = {
-                        "column": j,
-                        "new_value": temp_cleaned_row[j]
-                    }
-                    if (si, j) in all_errors:
-                        update_dictionary["context"] = [cv if j != cj and fd_degree[cj, j] >= self.MIN_FD_DEGREE
-                                                        else self.IGNORE_SIGN for cj, cv in enumerate(temp_cleaned_row)]
-                    else:
-                        update_dictionary["context"] = [cv if j != cj and fd_degree[cj, j] >= self.MIN_FD_DEGREE and (si, cj) in all_errors
-                                                        else self.IGNORE_SIGN for cj, cv in enumerate(temp_cleaned_row)]
-                    self.context_based_models_updater(context_models, update_dictionary)
-                for j in data_errors_per_column:
-                    x_train = []
-                    y_train = []
-                    x_test = []
-                    test_cell_value_list = []
-                    error_dictionary = {"column": j}
-                    domain_corrections = [self.domain_based_corrector(domain_model, error_dictionary)]
-                    for k, cell in enumerate(data_errors_per_column[j]):
-                        if self.MIN_CORRECTION_PROBABILITY > 0.0 and cell in correction_dictionary and cell[0] not in labeled_tuples:
-                            continue
-                        error_dictionary["old_value"] = d.dataframe.iloc[cell]
-                        error_dictionary["context"] = list(d.dataframe.iloc[cell[0], :])
-                        value_corrections = self.value_based_corrector(value_models, error_dictionary)
-                        context_corrections = self.context_based_corrector(context_models, error_dictionary)
-                        models_corrections = value_corrections + context_corrections + domain_corrections
-                        fv = {}
-                        for i, model in enumerate(models_corrections):
-                            for v in model:
-                                if v not in fv:
-                                    fv[v] = numpy.zeros(len(models_corrections))
-                                fv[v][i] = model[v]
-                        for v in fv:
-                            if cell[0] in labeled_tuples:
-                                x_train.append(fv[v])
-                                y_train.append(int(v == correction_dictionary[cell]))
-                            else:
-                                x_test.append(fv[v])
-                                test_cell_value_list.append([cell, v])
-                        if k % 1000 == 0:
-                            print(j, "|", k, "/", len(data_errors_per_column[j]), "|", len(fv))
-                    if self.CLASSIFICATION_MODEL == "ABC":
-                        classification_model = sklearn.ensemble.AdaBoostClassifier(n_estimators=100)
-                    if self.CLASSIFICATION_MODEL == "DTC":
-                        classification_model = sklearn.tree.DecisionTreeClassifier(criterion="gini")
-                    if self.CLASSIFICATION_MODEL == "GBC":
-                        classification_model = sklearn.ensemble.GradientBoostingClassifier(n_estimators=100)
-                    if self.CLASSIFICATION_MODEL == "GNB":
-                        classification_model = sklearn.naive_bayes.GaussianNB()
-                    if self.CLASSIFICATION_MODEL == "KNC":
-                        classification_model = sklearn.neighbors.KNeighborsClassifier(n_neighbors=1)
-                    if self.CLASSIFICATION_MODEL == "SGDC":
-                        classification_model = sklearn.linear_model.SGDClassifier(loss="hinge", penalty="l2")
-                    if self.CLASSIFICATION_MODEL == "SVC":
-                        classification_model = sklearn.svm.SVC(kernel="sigmoid")
-                    if x_train and x_test:
-                        if sum(y_train) == 0:
-                            predicted_labels = [0] * len(x_test)
-                        elif sum(y_train) == len(y_train):
-                            predicted_labels = [1] * len(x_test)
+            cell = (d.sampled_tuple, j)
+            if d.dataframe.iloc[cell] != d.clean_dataframe.iloc[cell]:
+                d.labeled_cells[cell] = d.clean_dataframe.iloc[cell]
+        if self.VERBOSE:
+            print("Tuple {} is labeled.".format(d.sampled_tuple))
+
+    def update_models(self, d):
+        """
+        This method updates the error corrector models with a new labeled tuple.
+        """
+        cleaned_sampled_tuple = [d.labeled_cells[(d.sampled_tuple, j)] if (d.sampled_tuple, j) in d.labeled_cells else v
+                                 for j, v in enumerate(d.dataframe.iloc[d.sampled_tuple, :])]
+        for j in range(d.dataframe.shape[1]):
+            cell = (d.sampled_tuple, j)
+            update_dictionary = {
+                "column": cell[1],
+                "old_value": d.dataframe.iloc[cell],
+                "new_value": cleaned_sampled_tuple[j],
+            }
+            if cell in d.labeled_cells:
+                if cell not in d.detected_cells:
+                    d.detected_cells[cell] = "JUST A DUMMY VALUE"
+                    self._to_model_adder(d.column_errors, cell[1], cell)
+                self._value_based_models_updater(d.value_models, update_dictionary)
+                self._domain_based_model_updater(d.domain_models, update_dictionary)
+                update_dictionary["vicinity"] = [cv if j != cj else self.IGNORE_SIGN
+                                                 for cj, cv in enumerate(cleaned_sampled_tuple)]
+            else:
+                update_dictionary["vicinity"] = [cv if j != cj and (d.sampled_tuple, cj) in d.labeled_cells
+                                                 else self.IGNORE_SIGN for cj, cv in enumerate(cleaned_sampled_tuple)]
+            self._vicinity_based_models_updater(d.vicinity_models, update_dictionary)
+        if self.VERBOSE:
+            print("The error corrector models are updated with new labeled tuple {}.".format(d.sampled_tuple))
+
+    def generate_features(self, d):
+        """
+        This method generates a feature vector for each pair of a data error and a potential correction.
+        """
+        d.pair_features = {}
+        pairs_counter = 0
+        for j in d.column_errors:
+            error_dictionary = {"column": j}
+            domain_corrections = self._domain_based_corrector(d.domain_models, error_dictionary)
+            for k, cell in enumerate(d.column_errors[j]):
+                if not self.REFINE_PREDICTIONS and cell not in d.labeled_cells and cell in d.corrected_cells:
+                    continue
+                error_dictionary["old_value"] = d.dataframe.iloc[cell]
+                error_dictionary["vicinity"] = list(d.dataframe.iloc[cell[0], :])
+                value_corrections = self._value_based_corrector(d.value_models, error_dictionary)
+                vicinity_corrections = self._vicinity_based_corrector(d.vicinity_models, error_dictionary)
+                models_corrections = value_corrections + vicinity_corrections + domain_corrections
+                d.pair_features[cell] = {}
+                for mi, model in enumerate(models_corrections):
+                    for correction in model:
+                        if correction not in d.pair_features[cell]:
+                            d.pair_features[cell][correction] = numpy.zeros(len(models_corrections))
+                            pairs_counter += 1
+                        d.pair_features[cell][correction][mi] = model[correction]
+        if self.VERBOSE:
+            print("{} pairs of (a data error, a potential correction) are featurized.".format(pairs_counter))
+
+    def predict_corrections(self, d):
+        """
+        This method predicts
+        """
+        for j in d.column_errors:
+            x_train = []
+            y_train = []
+            x_test = []
+            test_cell_correction_list = []
+            for k, cell in enumerate(d.column_errors[j]):
+                if cell in d.pair_features:
+                    for correction in d.pair_features[cell]:
+                        if cell in d.labeled_cells:
+                            x_train.append(d.pair_features[cell][correction])
+                            y_train.append(int(correction == d.labeled_cells[cell]))
+                            d.corrected_cells[cell] = d.labeled_cells[cell]
                         else:
-                            classification_model.fit(x_train, y_train)
-                            predicted_labels = classification_model.predict(x_test)
-                        # predicted_probabilities = classification_model.predict_proba(x_test)
-                        # correction_confidence = {}
-                        for index, pl in enumerate(predicted_labels):
-                            cell, pc = test_cell_value_list[index]
-                            # confidence = predicted_probabilities[index][1]
-                            if pl:
-                                # if cell not in correction_confidence or confidence > correction_confidence[cell]:
-                                #     correction_confidence[cell] = confidence
-                                correction_dictionary[cell] = pc
-                s = len(labeled_tuples)
-                er = d.evaluate_data_cleaning(correction_dictionary)[-3:]
-                aggregate_results[s] = numpy.append(aggregate_results[s], [er], axis=0)
-                print(">>>", len(labeled_tuples), er)
-        results_string = "\\addplot[error bars/.cd,y dir=both,y explicit] coordinates{(0,0.0)"
-        for s in sampling_range:
-            mean = numpy.mean(aggregate_results[s], axis=0)
-            std = numpy.std(aggregate_results[s], axis=0)
-            print("Raha 2 on", d.name)
-            print("Labeled Tuples Count = {}".format(s))
-            print("Precision = {:.2f} +- {:.2f}".format(mean[0], std[0]))
-            print("Recall = {:.2f} +- {:.2f}".format(mean[1], std[1]))
-            print("F1 = {:.2f} +- {:.2f}".format(mean[2], std[2]))
-            print("--------------------")
-            # results_string += "({},{:.2f})+-(0,{:.2f})".format(s, mean[2], std[2])
-            results_string += "({},{:.2f})".format(s, mean[2])
-        results_string += "}; \\addlegendentry{Raha 2}"
-        print(results_string)
+                            x_test.append(d.pair_features[cell][correction])
+                            test_cell_correction_list.append([cell, correction])
+            if self.CLASSIFICATION_MODEL == "ABC":
+                classification_model = sklearn.ensemble.AdaBoostClassifier(n_estimators=100)
+            if self.CLASSIFICATION_MODEL == "DTC":
+                classification_model = sklearn.tree.DecisionTreeClassifier(criterion="gini")
+            if self.CLASSIFICATION_MODEL == "GBC":
+                classification_model = sklearn.ensemble.GradientBoostingClassifier(n_estimators=100)
+            if self.CLASSIFICATION_MODEL == "GNB":
+                classification_model = sklearn.naive_bayes.GaussianNB()
+            if self.CLASSIFICATION_MODEL == "KNC":
+                classification_model = sklearn.neighbors.KNeighborsClassifier(n_neighbors=1)
+            if self.CLASSIFICATION_MODEL == "SGDC":
+                classification_model = sklearn.linear_model.SGDClassifier(loss="hinge", penalty="l2")
+            if self.CLASSIFICATION_MODEL == "SVC":
+                classification_model = sklearn.svm.SVC(kernel="sigmoid")
+            if x_train and x_test:
+                if sum(y_train) == 0:
+                    predicted_labels = numpy.zeros(len(x_test))
+                elif sum(y_train) == len(y_train):
+                    predicted_labels = numpy.ones(len(x_test))
+                else:
+                    classification_model.fit(x_train, y_train)
+                    predicted_labels = classification_model.predict(x_test)
+                # predicted_probabilities = classification_model.predict_proba(x_test)
+                # correction_confidence = {}
+                for index, predicted_label in enumerate(predicted_labels):
+                    cell, predicted_correction = test_cell_correction_list[index]
+                    # confidence = predicted_probabilities[index][1]
+                    if predicted_label:
+                        # if cell not in correction_confidence or confidence > correction_confidence[cell]:
+                        #     correction_confidence[cell] = confidence
+                        d.corrected_cells[cell] = predicted_correction
+        if self.VERBOSE:
+            print("{:.0f}% ({} / {}) of data errors are corrected.".format(100 * len(d.corrected_cells) / len(d.detected_cells),
+                                                                           len(d.corrected_cells), len(d.detected_cells)))
+
+    def store_results(self, d):
+        """
+        This method stores the results.
+        """
+        ec_folder_path = os.path.join(d.results_folder, "error-correction")
+        if not os.path.exists(ec_folder_path):
+            os.mkdir(ec_folder_path)
+        pickle.dump(d.detected_cells, open(os.path.join(ec_folder_path, "correction.dictionary"), "wb"))
+        if self.VERBOSE:
+            print("The results are stored in {}.".format(os.path.join(ec_folder_path, "correction.dictionary")))
+
+    def run(self, d):
+        """
+        This method runs Baran on an input dataset to correct data errors.
+        """
+        print("------------------------------------------------------------------------\n"
+              "---------------------Initialize the Dataset Object----------------------\n"
+              "------------------------------------------------------------------------")
+        d = self.initialize_dataset(d)
+        print("------------------------------------------------------------------------\n"
+              "--------------------Initialize Error Corrector Models-------------------\n"
+              "------------------------------------------------------------------------")
+        self.initialize_models(d)
+        print("------------------------------------------------------------------------\n"
+              "--------------Iterative Tuple Sampling, Labeling, and Learning----------\n"
+              "------------------------------------------------------------------------")
+        while len(d.labeled_tuples) < self.LABELING_BUDGET:
+            self.sample_tuple(d)
+            if d.has_ground_truth:
+                self.label_with_ground_truth(d)
+            # else:
+            #   In this case, user should label the tuple interactively as shown in the baran.ipynb notebook.
+            self.update_models(d)
+            self.generate_features(d)
+            self.predict_corrections(d)
+            print("------------------------------------------------------------------------")
+        if self.SAVE_RESULTS:
+            self.store_results(d)
+        return d.corrected_cells
 ########################################
 
 
 ########################################
 if __name__ == "__main__":
-    # --------------------
-    application = Raha2()
-    # --------------------
     dataset_name = "flights"
     dataset_dictionary = {
         "name": dataset_name,
-        "path": os.path.join(application.DATASETS_FOLDER, dataset_name, "dirty.csv"),
-        "clean_path": os.path.join(application.DATASETS_FOLDER, dataset_name, "clean.csv")
+        "path": os.path.join("datasets", dataset_name, "dirty.csv"),
+        "clean_path": os.path.join("datasets", dataset_name, "clean.csv")
     }
-    d = dataset.Dataset(dataset_dictionary)
+    data = dataset.Dataset(dataset_dictionary)
+    app = Baran()
+    app.PRETRAINED_VALUE_BASED_MODELS_PATH = "results/corrector-models/pretrained_value_based_models.dictionary"
+
+    RUN_COUNT = 1
+    pp = rr = ff = 0.0
+    for run in range(RUN_COUNT):
+        print("Run:", run)
+        data.detected_cells = dict(data.get_actual_errors_dictionary())
+        # data.detected_cells = pickle.load(open("results/error-detection/{}.dictionary".format(data.name), "rb"))
+        correction_dictionary = app.run(data)
+        precision, recall, f1 = data.get_data_cleaning_evaluation(correction_dictionary)[-3:]
+        pp += precision / RUN_COUNT
+        rr += recall / RUN_COUNT
+        ff += f1 / RUN_COUNT
+    print("Baran's performance on {}:\nPrecision = {:.2f}\nRecall = {:.2f}\nF1 = {:.2f}".format(data.name, pp, rr, ff))
     # --------------------
-    # application.revision_extractor()
-    # application.value_based_models_pretrainer()
-    # detected_data_errors = dict(d.actual_errors_dictionary)
-    # detected_data_errors = pickle.load(open("results/error-detection/{}.dictionary".format(d.name), "rb"))
-    # application.error_corrector(d, detected_data_errors)
-    # --------------------
+    # app.extract_revisions(wikipedia_dumps_folder="../wikipedia-data-sample")
+    # app.pretrain_value_based_models(revision_data_folder="../wikipedia-data-sample/revision-data")
 ########################################
